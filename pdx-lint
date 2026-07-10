@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""PDX mod linter. Discovers and runs lint checks from a mod's tools/lint/ directory.
+
+Each mod defines its own checks as Python modules with a run(mod_root) function.
+This tool provides the runner framework: incremental file tracking, CLI, output.
+
+Usage:
+    pdx-lint                    # lint changed files in current mod
+    pdx-lint --full             # lint all files
+    pdx-lint /path/to/mod       # lint specific mod
+    pdx-lint --skip check_name  # skip a check
+"""
+
+import importlib
+import importlib.util
+import inspect
+import json
+import pkgutil
+import sys
+from pathlib import Path
+
+
+def find_mod_root(start: Path | None = None) -> Path:
+    p = (start or Path.cwd()).resolve()
+    while True:
+        if (p / ".metadata").is_dir():
+            return p
+        parent = p.parent
+        if parent == p:
+            break
+        p = parent
+    print("Error: could not find mod root (.metadata/ directory). "
+          "Run from inside a mod directory or pass a path.", file=sys.stderr)
+    sys.exit(1)
+
+
+MANIFEST_PATH = ".claude/lint_manifest.json"
+
+
+def load_manifest(mod_root: Path) -> dict[str, float]:
+    p = mod_root / MANIFEST_PATH
+    if p.exists():
+        try:
+            return json.loads(p.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def save_manifest(mod_root: Path, manifest: dict[str, float]):
+    p = mod_root / MANIFEST_PATH
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(manifest, indent=2) + "\n")
+
+
+def changed_files(mod_root: Path, manifest: dict[str, float],
+                  exts: tuple[str, ...] = (".txt", ".gui", ".yml")) -> set[Path]:
+    changed = set()
+    for f in mod_root.rglob("*"):
+        if f.suffix not in exts:
+            continue
+        if ".claude" in f.parts or "__pycache__" in f.parts:
+            continue
+        rel = str(f.relative_to(mod_root))
+        mtime = f.stat().st_mtime
+        if rel not in manifest or manifest[rel] != mtime:
+            changed.add(f)
+    return changed
+
+
+def discover_checks(mod_root: Path) -> list[tuple[str, callable]]:
+    lint_dir = mod_root / "tools" / "lint"
+    if not lint_dir.is_dir():
+        return []
+
+    tools_dir = str(mod_root / "tools")
+    if tools_dir not in sys.path:
+        sys.path.insert(0, tools_dir)
+
+    # Force-reload the lint package so each mod gets its own modules
+    for key in [k for k in sys.modules if k == "lint" or k.startswith("lint.")]:
+        del sys.modules[key]
+
+    checks = []
+    try:
+        import lint as lint_pkg
+        for info in pkgutil.iter_modules([str(lint_dir)]):
+            if info.name.startswith("_"):
+                continue
+            mod = importlib.import_module(f"lint.{info.name}")
+            if hasattr(mod, "run"):
+                checks.append((info.name, mod.run))
+    except Exception as e:
+        print(f"Error loading lint checks: {e}", file=sys.stderr)
+
+    return checks
+
+
+def run_all(mod_root: Path, skip: set[str] | None = None,
+            full: bool = False) -> dict[str, list[str]]:
+    skip = skip or set()
+    checks = discover_checks(mod_root)
+
+    if not checks:
+        print("  No lint checks found in tools/lint/", file=sys.stderr)
+        return {}
+
+    manifest = load_manifest(mod_root)
+
+    if full:
+        file_changed = None
+    else:
+        file_changed = changed_files(mod_root, manifest)
+        if not file_changed:
+            return {}
+
+    results = {}
+    for name, fn in checks:
+        if name in skip:
+            continue
+        try:
+            sig = inspect.signature(fn)
+            if "changed" in sig.parameters:
+                errors = fn(mod_root, changed=file_changed)
+            else:
+                errors = fn(mod_root)
+        except Exception as e:
+            errors = [f"check crashed: {e}"]
+        if errors:
+            results[name] = errors
+
+    if not results and file_changed is not None:
+        for f in file_changed:
+            rel = str(f.relative_to(mod_root))
+            manifest[rel] = f.stat().st_mtime
+        save_manifest(mod_root, manifest)
+
+    return results
+
+
+def main():
+    args = sys.argv[1:]
+    full = "--full" in args
+    args = [a for a in args if a != "--full"]
+
+    skip = set()
+    while "--skip" in args:
+        idx = args.index("--skip")
+        if idx + 1 < len(args):
+            skip.add(args[idx + 1])
+            args = args[:idx] + args[idx + 2:]
+        else:
+            args = args[:idx]
+
+    if args:
+        mod_root = Path(args[0]).resolve()
+        if not (mod_root / ".metadata").is_dir():
+            print(f"Warning: {mod_root} has no .metadata/ — might not be a mod root",
+                  file=sys.stderr)
+    else:
+        mod_root = find_mod_root()
+
+    label = "Linting (full)" if full else "Linting"
+    print(f"{label}: {mod_root.name}")
+    results = run_all(mod_root, skip=skip, full=full)
+
+    if not results:
+        print("  All checks passed.")
+        return 0
+
+    total = 0
+    for name, errors in sorted(results.items()):
+        print(f"\n  [{name}] ({len(errors)} issue{'s' if len(errors) != 1 else ''})")
+        for err in errors:
+            print(f"    {err}")
+        total += len(errors)
+    print(f"\n  {total} issue{'s' if total != 1 else ''} found.")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
