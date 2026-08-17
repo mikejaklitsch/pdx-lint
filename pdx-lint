@@ -19,19 +19,9 @@ import pkgutil
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-def find_mod_root(start: Path | None = None) -> Path:
-    p = (start or Path.cwd()).resolve()
-    while True:
-        if (p / ".metadata").is_dir():
-            return p
-        parent = p.parent
-        if parent == p:
-            break
-        p = parent
-    print("Error: could not find mod root (.metadata/ directory). "
-          "Run from inside a mod directory or pass a path.", file=sys.stderr)
-    sys.exit(1)
+from pdx_utilities.paths import find_mod_root_or_exit as find_mod_root  # noqa: E402
 
 
 MANIFEST_PATH = ".claude/lint_manifest.json"
