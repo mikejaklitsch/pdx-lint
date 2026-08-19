@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pdx-lint"
+version = "1.0.0"
+description = "Mod linter framework for Paradox mods"
+requires-python = ">=3.10"
+
+[project.scripts]
+pdx-lint = "pdx_lint.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["pdx_lint*", "pdx_utilities*"]
