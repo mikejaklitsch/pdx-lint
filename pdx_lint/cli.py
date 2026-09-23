@@ -4,6 +4,7 @@ import importlib
 import importlib.util
 import inspect
 import json
+import os
 import pkgutil
 import sys
 from pathlib import Path
@@ -12,6 +13,9 @@ from pdx_utilities.paths import find_mod_root_or_exit as find_mod_root
 
 
 MANIFEST_PATH = ".claude/lint_manifest.json"
+
+
+PRUNE_DIRS = {".git", ".claude", "__pycache__", ".gui_workspace"}
 
 
 def load_manifest(mod_root: Path) -> dict[str, float]:
@@ -33,15 +37,18 @@ def save_manifest(mod_root: Path, manifest: dict[str, float]):
 def changed_files(mod_root: Path, manifest: dict[str, float],
                   exts: tuple[str, ...] = (".txt", ".gui", ".yml")) -> set[Path]:
     changed = set()
-    for f in mod_root.rglob("*"):
-        if f.suffix not in exts:
-            continue
-        if ".claude" in f.parts or "__pycache__" in f.parts:
-            continue
-        rel = str(f.relative_to(mod_root))
-        mtime = f.stat().st_mtime
-        if rel not in manifest or manifest[rel] != mtime:
-            changed.add(f)
+    for dirpath, dirs, files in os.walk(mod_root):
+        # .git and .claude (agent worktrees) hold no mod content and about
+        # half of all entries under the mod root.
+        dirs[:] = [d for d in dirs if d not in PRUNE_DIRS]
+        for name in files:
+            if not name.endswith(exts):
+                continue
+            f = Path(dirpath) / name
+            rel = str(f.relative_to(mod_root))
+            mtime = f.stat().st_mtime
+            if rel not in manifest or manifest[rel] != mtime:
+                changed.add(f)
     return changed
 
 
