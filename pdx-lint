@@ -20,6 +20,10 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+# pdx_utilities is the shared sibling checkout (../pdx-utilities), not vendored.
+_shared = Path(__file__).resolve().parent.parent / "pdx-utilities"
+if _shared.is_dir():
+    sys.path.insert(1, str(_shared))
 
 from pdx_utilities.paths import find_mod_root_or_exit as find_mod_root  # noqa: E402
 

@@ -7,9 +7,10 @@ name = "pdx-lint"
 version = "1.0.0"
 description = "Mod linter framework for Paradox mods"
 requires-python = ">=3.10"
+dependencies = ["pdx-utilities @ git+https://github.com/mikejaklitsch/pdx-utilities.git"]
 
 [project.scripts]
 pdx-lint = "pdx_lint.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["pdx_lint*", "pdx_utilities*"]
+include = ["pdx_lint*"]
