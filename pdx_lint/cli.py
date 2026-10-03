@@ -1,12 +1,15 @@
 """PDX mod linter. Discovers and runs lint checks from a mod's tools/lint/ directory."""
 
+import hashlib
 import importlib
 import importlib.util
 import inspect
 import json
+import multiprocessing
 import os
 import pkgutil
 import sys
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 from pdx_utilities.paths import find_mod_root_or_exit as find_mod_root
@@ -18,37 +21,64 @@ MANIFEST_PATH = ".claude/lint_manifest.json"
 PRUNE_DIRS = {".git", ".claude", "__pycache__", ".gui_workspace"}
 
 
-def load_manifest(mod_root: Path) -> dict[str, float]:
+def load_manifest(mod_root: Path) -> dict:
+    """State of the last runs: 'files' maps a path to [mtime, size, sha1 or None];
+    'pending' maps a check to the paths it has not passed since they changed.
+    A version 1 manifest (path -> mtime of the last full pass) loads as files
+    with an unknown hash and nothing pending."""
     p = mod_root / MANIFEST_PATH
+    data = {}
     if p.exists():
         try:
-            return json.loads(p.read_text())
+            data = json.loads(p.read_text())
         except Exception:
-            pass
-    return {}
+            data = {}
+    if data.get("version") == 2:
+        return data
+    return {"version": 2, "files": {rel: [mtime, None, None] for rel, mtime in data.items()
+                                    if isinstance(mtime, (int, float))},
+            "pending": {}}
 
 
-def save_manifest(mod_root: Path, manifest: dict[str, float]):
+def save_manifest(mod_root: Path, manifest: dict):
     p = mod_root / MANIFEST_PATH
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(manifest, indent=2) + "\n")
+    p.write_text(json.dumps(manifest, indent=1, sort_keys=True) + "\n")
 
 
-def changed_files(mod_root: Path, manifest: dict[str, float],
+def _sha1(path: Path) -> str | None:
+    try:
+        return hashlib.sha1(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def changed_files(mod_root: Path, manifest: dict,
                   exts: tuple[str, ...] = (".txt", ".gui", ".yml")) -> set[Path]:
+    """Files whose content changed since the manifest saw them, and new files.
+    Only a file with a new mtime or size is read; one rewritten byte for byte
+    (a generator run) does not count. Updates manifest['files']."""
+    files = manifest["files"]
     changed = set()
-    for dirpath, dirs, files in os.walk(mod_root):
+    for dirpath, dirs, names in os.walk(mod_root):
         # .git and .claude (agent worktrees) hold no mod content and about
         # half of all entries under the mod root.
         dirs[:] = [d for d in dirs if d not in PRUNE_DIRS]
-        for name in files:
+        for name in names:
             if not name.endswith(exts):
                 continue
             f = Path(dirpath) / name
             rel = str(f.relative_to(mod_root))
-            mtime = f.stat().st_mtime
-            if rel not in manifest or manifest[rel] != mtime:
+            st = f.stat()
+            old = files.get(rel)
+            if old and old[0] == st.st_mtime and old[1] in (None, st.st_size):
+                if old[1] is None:
+                    old[1] = st.st_size
+                continue
+            sha = _sha1(f)
+            if not (old and old[2] is not None and old[2] == sha):
                 changed.add(f)
+            files[rel] = [st.st_mtime, st.st_size, sha]
     return changed
 
 
@@ -80,45 +110,54 @@ def discover_checks(mod_root: Path) -> list[tuple[str, callable]]:
     return checks
 
 
+def _run_check(fn, mod_root: Path, changed: set[Path] | None) -> list[str]:
+    try:
+        if "changed" in inspect.signature(fn).parameters:
+            return fn(mod_root, changed=changed) or []
+        return fn(mod_root) or []
+    except Exception as e:
+        return [f"check crashed: {e}"]
+
+
 def run_all(mod_root: Path, skip: set[str] | None = None,
             full: bool = False) -> dict[str, list[str]]:
+    """Run the checks side by side, each in its own forked process. Each check
+    gets the files it has not passed since they changed: a failing check keeps
+    its files pending, and the other checks do not see them again."""
     skip = skip or set()
-    checks = discover_checks(mod_root)
+    checks = [(n, fn) for n, fn in discover_checks(mod_root) if n not in skip]
 
     if not checks:
         print("  No lint checks found in tools/lint/", file=sys.stderr)
         return {}
 
     manifest = load_manifest(mod_root)
-
+    pending = manifest["pending"]
+    new = changed_files(mod_root, manifest)
+    for name, _fn in checks:
+        pending[name] = sorted(set(pending.get(name, [])) | {str(f.relative_to(mod_root)) for f in new})
     if full:
-        file_changed = None
+        todo = {name: None for name, _fn in checks}
     else:
-        file_changed = changed_files(mod_root, manifest)
-        if not file_changed:
+        if not any(pending[name] for name, _fn in checks):
+            save_manifest(mod_root, manifest)
             return {}
+        # files deleted since they changed drop out
+        todo = {name: {mod_root / rel for rel in pending[name] if (mod_root / rel).exists()}
+                for name, _fn in checks if pending[name]}
 
     results = {}
-    for name, fn in checks:
-        if name in skip:
-            continue
-        try:
-            sig = inspect.signature(fn)
-            if "changed" in sig.parameters:
-                errors = fn(mod_root, changed=file_changed)
+    ctx = multiprocessing.get_context("fork")
+    with ProcessPoolExecutor(max_workers=min(len(todo), os.cpu_count() or 4), mp_context=ctx) as pool:
+        futures = {name: pool.submit(_run_check, fn, mod_root, todo[name])
+                   for name, fn in checks if name in todo}
+        for name, fut in futures.items():
+            errors = fut.result()
+            if errors:
+                results[name] = errors
             else:
-                errors = fn(mod_root)
-        except Exception as e:
-            errors = [f"check crashed: {e}"]
-        if errors:
-            results[name] = errors
-
-    if not results and file_changed is not None:
-        for f in file_changed:
-            rel = str(f.relative_to(mod_root))
-            manifest[rel] = f.stat().st_mtime
-        save_manifest(mod_root, manifest)
-
+                pending[name] = []
+    save_manifest(mod_root, manifest)
     return results
 
 
